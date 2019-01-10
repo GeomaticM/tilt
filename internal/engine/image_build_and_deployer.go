@@ -59,52 +59,53 @@ func (ibd *ImageBuildAndDeployer) SetInjectSynclet(inject bool) {
 	ibd.injectSynclet = inject
 }
 
-func (ibd *ImageBuildAndDeployer) BuildAndDeploy(ctx context.Context, manifest model.Manifest, state store.BuildState) (br store.BuildResult, err error) {
-	if manifest.IsDC() {
-		return store.BuildResult{}, RedirectToNextBuilderf("dc manifest")
+func (ibd *ImageBuildAndDeployer) BuildAndDeploy(ctx context.Context, specs []model.TargetSpec, stateSet store.BuildStateSet) (resultSet store.BuildResultSet, err error) {
+	images, resources := extractImageAndK8sTargets(specs)
+	if len(resources) == 0 && len(images) == 0 {
+		return store.BuildResultSet{}, RedirectToNextBuilderf("no images or k8s resources")
 	}
+
 	span, ctx := opentracing.StartSpanFromContext(ctx, "daemon-ImageBuildAndDeployer-BuildAndDeploy")
+	span.SetTag("target", resources[0].Name)
 	defer span.Finish()
 
 	startTime := time.Now()
 	defer func() {
 		incremental := "0"
-		if state.HasImage() {
-			incremental = "1"
+		for _, state := range stateSet {
+			if state.HasImage() {
+				incremental = "1"
+			}
 		}
 		tags := map[string]string{"incremental": incremental}
 		ibd.analytics.Timer("build.image", time.Since(startTime), tags)
 	}()
 
-	numStages := 2
+	numStages := len(images) + len(resources)
 	ps := build.NewPipelineState(ctx, numStages, ibd.clock)
 	defer func() { ps.End(ctx, err) }()
 
-	err = manifest.Validate()
-	if err != nil {
-		return store.BuildResult{}, err
+	refs := []reference.NamedTagged{}
+	results := store.BuildResultSet{}
+	for _, image := range images {
+		ref, err := ibd.build(ctx, image, stateSet[image.ID()], ps)
+		if err != nil {
+			return store.BuildResultSet{}, err
+		}
+		results[image.ID()] = store.BuildResult{
+			Image: ref,
+		}
+		refs = append(refs, ref)
 	}
 
-	ref, err := ibd.build(ctx, manifest.ImageTarget, state, ps)
-	if err != nil {
-		return store.BuildResult{}, err
+	for _, kTarget := range resources {
+		err = ibd.deploy(ctx, ps, kTarget, refs)
+		if err != nil {
+			return store.BuildResultSet{}, err
+		}
 	}
 
-	if !manifest.IsK8s() {
-		// If a non-yaml manifest reaches this code, something is wrong.
-		// If we change BaD structure such that that might reasonably happen,
-		// this should be a `RedirectToNextBuilder` error.
-		return store.BuildResult{}, fmt.Errorf("manifest %s has no k8s deploy info", manifest.Name)
-	}
-
-	err = ibd.deploy(ctx, ps, manifest.K8sTarget(), ref)
-	if err != nil {
-		return store.BuildResult{}, err
-	}
-
-	return store.BuildResult{
-		Image: ref,
-	}, nil
+	return results, nil
 }
 
 func (ibd *ImageBuildAndDeployer) build(ctx context.Context, image model.ImageTarget, state store.BuildState, ps *build.PipelineState) (reference.NamedTagged, error) {
@@ -186,7 +187,7 @@ func (ibd *ImageBuildAndDeployer) build(ctx context.Context, image model.ImageTa
 }
 
 // Returns: the entities deployed and the namespace of the pod with the given image name/tag.
-func (ibd *ImageBuildAndDeployer) deploy(ctx context.Context, ps *build.PipelineState, k8sInfo model.K8sTarget, ref reference.NamedTagged) error {
+func (ibd *ImageBuildAndDeployer) deploy(ctx context.Context, ps *build.PipelineState, k8sInfo model.K8sTarget, refs []reference.NamedTagged) error {
 
 	ps.StartPipelineStep(ctx, "Deploying")
 	defer ps.EndPipelineStep(ctx)
@@ -200,7 +201,7 @@ func (ibd *ImageBuildAndDeployer) deploy(ctx context.Context, ps *build.Pipeline
 		return err
 	}
 
-	replacedAny := false
+	replacedAny := map[string]bool{}
 	newK8sEntities := []k8s.K8sEntity{}
 	for _, e := range entities {
 		e, err = k8s.InjectLabels(e, []k8s.LabelPair{TiltRunLabel(), {Key: ManifestNameLabel, Value: k8sInfo.Name.String()}})
@@ -222,14 +223,15 @@ func (ibd *ImageBuildAndDeployer) deploy(ctx context.Context, ps *build.Pipeline
 		if ibd.canSkipPush() {
 			policy = v1.PullNever
 		}
-		if ref != nil {
+
+		for _, ref := range refs {
 			var replaced bool
 			e, replaced, err = k8s.InjectImageDigest(e, ref, policy)
 			if err != nil {
 				return err
 			}
 			if replaced {
-				replacedAny = true
+				replacedAny[ref.String()] = true
 
 				if ibd.injectSynclet {
 					var sidecarInjected bool
@@ -247,8 +249,10 @@ func (ibd *ImageBuildAndDeployer) deploy(ctx context.Context, ps *build.Pipeline
 		newK8sEntities = append(newK8sEntities, e)
 	}
 
-	if ref != nil && !replacedAny {
-		return fmt.Errorf("Docker image missing from yaml: %s", ref)
+	for _, ref := range refs {
+		if !replacedAny[ref.String()] {
+			return fmt.Errorf("Docker image missing from yaml: %s", ref)
+		}
 	}
 
 	err = ibd.k8sClient.Upsert(ctx, newK8sEntities)
